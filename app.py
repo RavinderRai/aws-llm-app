@@ -13,7 +13,7 @@ from langchain.llms.bedrock import Bedrock
 
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_community.document_loaders import PyPDFLoader
 
 # Vector Embedding And Vector Store
 
@@ -32,8 +32,11 @@ bedrock_embeddings=BedrockEmbeddings(model_id="amazon.titan-embed-text-v1",clien
 
 ## Data Ingestion
 
-def data_ingestion():
-    loader=PyPDFDirectoryLoader("data")
+def data_ingestion(pdf):
+    with open("temp_pdf.pdf", "wb") as f:
+        f.write(pdf.read())
+
+    loader = PyPDFLoader("temp_pdf.pdf")
     documents=loader.load()
 
     # - in our testing Character split works better with this PDF data set
@@ -46,7 +49,7 @@ def data_ingestion():
 
 ## Vector Embedding and vector store
 
-def get_vector_store(docs):
+def get_vector_store(docs, index_name):
     if not docs:
         raise ValueError("The document list is empty. Please check the data ingestion process.")
     
@@ -54,7 +57,7 @@ def get_vector_store(docs):
         docs,
         bedrock_embeddings
     )
-    vectorstore_faiss.save_local("faiss_index")
+    vectorstore_faiss.save_local(index_name)
 
 def get_claude_llm():
     ## create the Anthropic Model
@@ -75,22 +78,29 @@ def get_llama2_llm():
     return llm
 
 prompt_template = """
+Human: You are provided with context from two different documents. 
+Use the information from both documents to answer the question at the end. 
+If the documents provide conflicting information, highlight the differences. 
+Summarize with at least 250 words with detailed explanations. 
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
-Human: Use the following pieces of context to provide a 
-concise answer to the question at the end but usse atleast summarize with 
-250 words with detailed explaantions. If you don't know the answer, 
-just say that you don't know, don't try to make up an answer.
-<context>
-{context}
-</context
+<Document 1 Context>
+{context1}
+</Document 1 Context>
+
+<Document 2 Context>
+{context2}
+</Document 2 Context>
 
 Question: {question}
 
 Assistant:"""
 
 PROMPT = PromptTemplate(
-    template=prompt_template, input_variables=["context", "question"]
+    template=prompt_template, input_variables=["context1", "context2", "question"]
 )
+
+
 
 def get_response_llm(llm, vectorstore_faiss, query):
     qa = RetrievalQA.from_chain_type(
@@ -109,18 +119,23 @@ def get_response_llm(llm, vectorstore_faiss, query):
 
 
 def main():
-    st.set_page_config("Chat PDF")
-    st.header("Chat with PDF using AWS Bedrock")
+    st.set_page_config(page_title="Compare and Contrast two PDFs", page_icon=":books:")
+    st.header("Chat and compare two PDFs using AWS Bedrock")
 
     user_question = st.text_input("Ask a question from the PDF files")
 
     with st.sidebar:
-        st.title("Update or Create Vector Store")
+        st.title("Upload two PDF files.")
+        pdf1 = st.file_uploader("Upload the first document", type="pdf")
+        pdf2 = st.file_uploader("Upload the second document", type="pdf")
 
-        if st.button("Vectors Update"):
+        if st.button("Confirm Upload"):
             with st.spinner("Processing..."):
-                docs = data_ingestion()
-                get_vector_store(docs)
+                doc1 = data_ingestion(pdf1)
+                doc2 = data_ingestion(pdf2)
+
+                get_vector_store(doc1, "faiss_index1")
+                get_vector_store(doc2, "faiss_index2")
                 st.success("Done")
 
     if st.button("Cluade Output"):

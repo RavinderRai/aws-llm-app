@@ -1,53 +1,39 @@
-import json
-import os
-import sys
+import io
 import boto3
 import streamlit as st
-
-## We will be suing Titan Embeddings Model To generate Embedding
+from pypdf import PdfReader
 
 from langchain_community.embeddings import BedrockEmbeddings
 from langchain.llms.bedrock import Bedrock
-
-## Data Ingestion
-
-import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
-
-# Vector Embedding And Vector Store
-
+from langchain.docstore.document import Document
 from langchain.vectorstores import FAISS
-
-## LLm Models
 from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
-
-
 
 
 ## Bedrock Clients
 bedrock=boto3.client(service_name="bedrock-runtime")
 bedrock_embeddings=BedrockEmbeddings(model_id="amazon.titan-embed-text-v1",client=bedrock)
 
-## Data Ingestion
+
 
 def data_ingestion(pdf):
-    with open("temp_pdf.pdf", "wb") as f:
-        f.write(pdf.read())
-
-    loader = PyPDFLoader("temp_pdf.pdf")
-    documents=loader.load()
-
-    # - in our testing Character split works better with this PDF data set
-    text_splitter=RecursiveCharacterTextSplitter(chunk_size=10000,
-                                                 chunk_overlap=1000)
+    pdf_reader = PdfReader(io.BytesIO(pdf.getvalue()))
     
-    docs=text_splitter.split_documents(documents)
+    raw_text = ""
+    for page in pdf_reader.pages:
+        raw_text += page.extract_text()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=10000,
+        chunk_overlap=1000
+    )
+    
+    texts = text_splitter.split_text(raw_text)
+    docs = [Document(page_content=t) for t in texts]
+    
     return docs
 
-
-## Vector Embedding and vector store
 
 def get_vector_store(docs, index_name):
     if not docs:
@@ -59,7 +45,7 @@ def get_vector_store(docs, index_name):
     )
     vectorstore_faiss.save_local(index_name)
 
-def get_claude_llm():
+def get_llm():
     ## create the Anthropic Model
     llm=Bedrock(
         model_id="meta.llama3-8b-instruct-v1:0", 
@@ -68,19 +54,12 @@ def get_claude_llm():
     )
     return llm
 
-def get_llama2_llm():
-    ## create the Anthropic Model
-    llm=Bedrock(
-        model_id="meta.llama3-8b-instruct-v1:0", 
-        client=bedrock,
-        model_kwargs={'max_gen_len':512}
-    )
-    return llm
 
 prompt_template = """
-Human: You are provided with context from two different documents. 
-Use the information from both documents to answer the question at the end. 
-If the documents provide conflicting information, highlight the differences. 
+Human: You are provided with context from one or two documents. 
+Use the information from one or both documents to answer the question at the end. 
+More specifically, if you only have one, then only answer given that document.
+But if you have two, then answer as if you are comparing or contrasting them. 
 Summarize with at least 250 words with detailed explanations. 
 If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
@@ -102,27 +81,74 @@ PROMPT = PromptTemplate(
 
 
 
-def get_response_llm(llm, vectorstore_faiss, query):
-    qa = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=vectorstore_faiss.as_retriever(
-            search_type="similarity", 
-            search_kwargs={"k": 3}
-        ),
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": PROMPT}
-    )
+def get_response_llm(llm, vectorstore_faiss1, vectorstore_faiss2, query, use_both=False, use_1_or_2=1):
+    """Get the response from the LLM
+    Load the vector stores and get the documents. 
+    Then input the contexts into the prompt depending on the use case
+    Finally input the prompt into the LLM
+    """
+    if use_both:
+        retriever1 = vectorstore_faiss1.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+        retriever2 = vectorstore_faiss2.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
-    answer = qa({"query":query})
-    return answer['result']
+        docs1 = retriever1.get_relevant_documents(query)
+        docs2 = retriever2.get_relevant_documents(query)
+
+        context1 = "\n".join([doc.page_content for doc in docs1])
+        context2 = "\n".join([doc.page_content for doc in docs2])
+
+    else:
+        if use_1_or_2==1:
+            retriever1 = vectorstore_faiss1.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+            docs1 = retriever1.get_relevant_documents(query)
+            context1 = "\n".join([doc.page_content for doc in docs1])
+            context2 = ""
+        elif use_1_or_2==2:
+            retriever2 = vectorstore_faiss2.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+            docs2 = retriever2.get_relevant_documents(query)
+            context1 = ""
+            context2 = "\n".join([doc.page_content for doc in docs2])
+
+    prompt = PROMPT.format(context1=context1, context2=context2, question=query)
+    answer = llm(prompt)
+    return answer
+
+def chat_with_documents(user_question, use_both, use_1_or_2=None):
+    """
+    If the user clicks on the button to chat with both documents, then we'll load both.
+    Otherwise we load the one they want to chat with only.
+    """
+    try:
+        with st.spinner("Processing..."):
+            llm = get_llm()
+            if use_both:
+                vectorstore_faiss1 = FAISS.load_local("faiss_index1", bedrock_embeddings, allow_dangerous_deserialization=True)
+                vectorstore_faiss2 = FAISS.load_local("faiss_index2", bedrock_embeddings, allow_dangerous_deserialization=True)
+                response = get_response_llm(llm, vectorstore_faiss1, vectorstore_faiss2, user_question, use_both=True)
+            elif use_1_or_2 == 1:
+                vectorstore_faiss1 = FAISS.load_local("faiss_index1", bedrock_embeddings, allow_dangerous_deserialization=True)
+                response = get_response_llm(llm, vectorstore_faiss1, None, user_question, use_both=False, use_1_or_2=1)
+            elif use_1_or_2 == 2:
+                vectorstore_faiss2 = FAISS.load_local("faiss_index2", bedrock_embeddings, allow_dangerous_deserialization=True)
+                response = get_response_llm(llm, None, vectorstore_faiss2, user_question, use_both=False, use_1_or_2=2)
+        return response
+    
+    except UnboundLocalError:
+        st.write(f"Please upload {'both documents' if use_both else f'document {use_1_or_2}'}")
+    
+    except Exception as e:
+        error_type = type(e).__name__
+        st.write(f"An error occurred: {e} (Error type: {error_type})")
+    
+    return ""
 
 
 def main():
-    st.set_page_config(page_title="Compare and Contrast two PDFs", page_icon=":books:")
-    st.header("Chat and compare two PDFs using AWS Bedrock")
+    st.set_page_config(page_title="Chatting with two PDFs", page_icon=":books:")
+    st.header("Chat and compare two PDFs")
 
     user_question = st.text_input("Ask a question from the PDF files")
+    response = ""
 
     with st.sidebar:
         st.title("Upload two PDF files.")
@@ -136,16 +162,22 @@ def main():
 
                 get_vector_store(doc1, "faiss_index1")
                 get_vector_store(doc2, "faiss_index2")
+
                 st.success("Done")
 
-    if st.button("Cluade Output"):
-        with st.spinner("Processing..."):
-            faiss_index = FAISS.load_local("faiss_index", bedrock_embeddings, allow_dangerous_deserialization=True)
-            llm=get_claude_llm()
+    col1, col2, col3 = st.columns(3)
 
-            #faiss_index = get_vector_store(docs)
-            st.write(get_response_llm(llm, faiss_index, user_question))
-            st.success("Done")
+    if col1.button("Chat with both Documents"):
+        response = chat_with_documents(user_question, use_both=True)
+
+    if col2.button("Chat with Document 1"):
+        response = chat_with_documents(user_question, use_both=False, use_1_or_2=1)
+
+    if col3.button("Chat with Document 2"):
+        response = chat_with_documents(user_question, use_both=False, use_1_or_2=2)
+
+    st.write(response)
+
 
 
 if __name__ == "__main__":
